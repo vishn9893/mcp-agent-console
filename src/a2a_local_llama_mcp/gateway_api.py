@@ -3,12 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .llama_client import LlamaCppClient
 from .mcp_gateway import MCPGateway, MCPServerSpec
+from .namespacer import ToolNamespacer
+from .orchestrator import AgentOrchestrator
 
 
 class ServerInput(BaseModel):
@@ -33,7 +36,8 @@ INDEX_HTML = """<!doctype html>
 body{font:15px system-ui;margin:0;background:#f6f7f9;color:#20242b}main{max-width:1000px;margin:32px auto;padding:0 20px}
 h1{margin-bottom:4px}.muted{color:#697386}.toolbar{display:flex;gap:10px;margin:20px 0}button{border:0;border-radius:7px;padding:9px 14px;background:#2563eb;color:white;cursor:pointer}button.secondary{background:#e5e7eb;color:#20242b}.card{background:white;border:1px solid #e2e5ea;border-radius:10px;margin:14px 0;padding:18px;box-shadow:0 1px 2px #0000000b}.head{display:flex;justify-content:space-between;gap:10px}.status{font-size:13px;padding:4px 8px;border-radius:99px;background:#fee2e2}.connected{background:#dcfce7}.tool{border-top:1px solid #edf0f3;padding:12px 0;display:grid;grid-template-columns:28px 150px 1fr auto;gap:10px;align-items:start}.tool:first-child{border-top:0}.desc{color:#697386}.schema{font:12px ui-monospace,monospace;white-space:pre-wrap;color:#596273}.notice{margin:10px 0;color:#b42318}.ok{color:#087443}
 </style></head><body><main><h1>MCP Gateway</h1><div class="muted">Enable only the tools you want llama.cpp and A2A to use.</div>
-<div class="toolbar"><button onclick="save()">Save configuration</button><button class="secondary" onclick="connectAll()">Test connections</button><span id="model" class="muted"></span></div><div id="notice"></div><div id="servers"></div></main>
+<div class="toolbar"><button onclick="save()">Save configuration</button><button class="secondary" onclick="connectAll()">Test connections</button><span id="model" class="muted"></span></div><div id="notice"></div><div id="servers"></div>
+<section class="card"><h2>Live agent console</h2><div class="muted">Watch model turns, MCP calls, retries, and final responses.</div><div class="toolbar"><input id="question" style="flex:1;padding:9px;border:1px solid #d1d5db;border-radius:7px" value="Fetch https://example.com and summarize it."><button onclick="runAgent()">Run agent</button></div><div id="console" style="background:#111827;color:#e5e7eb;border-radius:8px;padding:12px;min-height:120px;max-height:360px;overflow:auto;font:13px ui-monospace,monospace"></div></section></main>
 <script>
 let state={servers:{}}; const el=id=>document.getElementById(id);
 async function load(){state=await fetch('/api/config').then(r=>r.json()); render(); modelStatus();}
@@ -44,6 +48,10 @@ async function connectAll(){for(let id of Object.keys(state.servers))await fetch
 async function testTool(id,name){let r=await fetch('/api/tools/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id,tool_name:name,arguments:{}})});let j=await r.json();notice(r.ok?name+': '+j.result:'Test failed: '+(j.detail||'unknown error'),r.ok?'ok':'');}
 async function modelStatus(){let r=await fetch('/api/model/status');let j=await r.json();el('model').textContent='llama.cpp: '+(j.connected?'connected':'unavailable')+(j.model?' · '+j.model:'');}
 function notice(t,c){el('notice').className=c||'notice';el('notice').textContent=t;setTimeout(()=>el('notice').textContent='',5000)} function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))} load();setInterval(load,10000);
+let socket;
+function logEvent(event){const line=document.createElement('div');line.style.cssText='margin:6px 0;padding-left:8px;border-left:3px solid '+(event.type==='error'?'#ef4444':event.type==='final'?'#a855f7':'#60a5fa');line.textContent='['+event.type.toUpperCase()+'] '+event.message;if(event.data){const pre=document.createElement('pre');pre.style.whiteSpace='pre-wrap';pre.textContent=JSON.stringify(event.data,null,2);line.appendChild(pre)}el('console').appendChild(line);el('console').scrollTop=el('console').scrollHeight}
+function runAgent(){const question=el('question').value.trim();if(!question)return;el('console').innerHTML='';if(!socket||socket.readyState!==WebSocket.OPEN){const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(scheme+'://'+location.host+'/ws/agent');socket.onopen=()=>socket.send(JSON.stringify({question}));}else socket.send(JSON.stringify({question}));}
+function setupSocket(){const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(scheme+'://'+location.host+'/ws/agent');socket.onmessage=e=>logEvent(JSON.parse(e.data));socket.onclose=()=>logEvent({type:'info',message:'Agent stream disconnected.'});} setupSocket();
 </script></body></html>"""
 
 
@@ -53,6 +61,29 @@ def create_gateway_api(gateway: MCPGateway, settings: Settings) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
         return INDEX_HTML
+
+    @app.websocket("/ws/agent")
+    async def agent_websocket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        orchestrator = AgentOrchestrator(
+            ToolNamespacer(),
+            gateway,
+            LlamaCppClient(settings.llama_base_url, settings.llama_api_key, settings.llama_model),
+            settings.max_tool_rounds,
+        )
+        try:
+            while True:
+                payload = await websocket.receive_json()
+                question = payload.get("question") if isinstance(payload, dict) else None
+                if not isinstance(question, str) or not question.strip():
+                    await websocket.send_json({"type": "error", "message": "Missing 'question' parameter.", "data": None})
+                    continue
+                await gateway.ensure_connected()
+                await orchestrator.execute_query(
+                    question.strip(), gateway.enabled_tools_by_server(), event_sink=websocket
+                )
+        except WebSocketDisconnect:
+            return
 
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:

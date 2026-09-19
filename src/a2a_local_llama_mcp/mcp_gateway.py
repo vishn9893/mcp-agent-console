@@ -150,6 +150,21 @@ class MCPGateway:
                     seen.add(name)
         return result
 
+    def enabled_tools_by_server(self) -> dict[str, list[dict[str, Any]]]:
+        """Return enabled tool schemas grouped by their MCP server."""
+        result: dict[str, list[dict[str, Any]]] = {}
+        for server_id, spec in self.servers.items():
+            connection = self.connections.get(server_id)
+            if not connection:
+                continue
+            tools = [
+                tool for tool in connection.tools
+                if tool["function"]["name"] in spec.enabled_tools
+            ]
+            if tools:
+                result[server_id] = tools
+        return result
+
     def resolve_tool(self, name: str) -> tuple[str, str]:
         matches: list[tuple[str, str]] = []
         for server_id, spec in self.servers.items():
