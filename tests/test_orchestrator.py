@@ -99,3 +99,26 @@ def test_event_sink_receives_turn_tool_and_final_events():
     assert [event["type"] for event in sink.events] == [
         "info", "turn_start", "tool_call", "tool_result", "turn_start", "final"
     ]
+
+
+def test_restricted_tool_pauses_until_approval_then_executes():
+    async def scenario():
+        llama = FakeLlama([
+            {"role": "assistant", "tool_calls": [{"id": "approval-1", "function": {"name": "filesystem__write_file", "arguments": '{"path":"a.txt"}'}}]},
+            {"role": "assistant", "content": "approved"},
+        ])
+        gateway = FakeGateway("written")
+        sink = FakeSink()
+        orchestrator = AgentOrchestrator(ToolNamespacer(), gateway, llama)
+        task = asyncio.create_task(orchestrator.execute_query("write it", {"filesystem": [tool("write_file")]}, sink))
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if "approval-1" in orchestrator.approval_futures:
+                break
+        assert "approval-1" in orchestrator.approval_futures
+        assert any(event["type"] == "awaiting_approval" for event in sink.events)
+        assert orchestrator.resolve_approval("approval-1", True)
+        assert await task == "approved"
+        assert gateway.calls == [("filesystem", "write_file", {"path": "a.txt"})]
+
+    asyncio.run(scenario())

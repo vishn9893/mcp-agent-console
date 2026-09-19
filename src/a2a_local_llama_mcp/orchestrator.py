@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from typing import Any, Protocol
 
 from .namespacer import ToolNamespacer
+
+
+RESTRICTED_TOOLS = frozenset({
+    "filesystem__write_file",
+    "filesystem__delete_file",
+    "shell__execute_command",
+})
 
 
 class LlamaChatClient(Protocol):
@@ -29,11 +37,22 @@ class AgentOrchestrator:
         mcp_client: MCPToolClient,
         llama_client: LlamaChatClient,
         max_tool_rounds: int = 4,
+        restricted_tools: set[str] | frozenset[str] | None = None,
     ) -> None:
         self.namespacer = namespacer
         self.mcp_client = mcp_client
         self.llama = llama_client
         self.max_tool_rounds = max_tool_rounds
+        self.restricted_tools = frozenset(restricted_tools if restricted_tools is not None else RESTRICTED_TOOLS)
+        self.approval_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+    def resolve_approval(self, call_id: str, approved: bool, reason: str = "") -> bool:
+        """Resolve a pending approval request; return false for stale request IDs."""
+        future = self.approval_futures.get(call_id)
+        if future is None or future.done():
+            return False
+        future.set_result({"approved": approved, "reason": reason})
+        return True
 
     async def execute_query(
         self,
@@ -70,7 +89,7 @@ class AgentOrchestrator:
             for call in tool_calls:
                 function = call.get("function") or {}
                 name = function.get("name")
-                call_id = call.get("id", name)
+                call_id = call.get("id") or f"{name}:{id(call)}"
                 raw_arguments = function.get("arguments", {})
                 await self.send_log(event_sink, "tool_call", f"Agent requested tool: {name}", {
                     "tool": name, "arguments": raw_arguments,
@@ -80,6 +99,26 @@ class AgentOrchestrator:
                     if not isinstance(arguments, dict):
                         raise ValueError("arguments must be a JSON object")
                     server_id, tool_name = self.namespacer.resolve(name)
+                    if name in self.restricted_tools:
+                        await self.send_log(event_sink, "awaiting_approval", f"Action hold: tool '{name}' requires approval.", {
+                            "call_id": call_id, "tool": name, "arguments": arguments,
+                        })
+                        approval_loop = asyncio.get_running_loop()
+                        approval_future = approval_loop.create_future()
+                        self.approval_futures[call_id] = approval_future
+                        try:
+                            decision = await approval_future
+                        finally:
+                            self.approval_futures.pop(call_id, None)
+                        if not decision.get("approved", False):
+                            reason = decision.get("reason") or "No reason provided."
+                            content = json.dumps({
+                                "error": "Execution denied by user.",
+                                "details": reason,
+                            })
+                            await self.send_log(event_sink, "info", f"User rejected execution of tool {name}.")
+                            messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": content})
+                            continue
                     result = await self.mcp_client.call(server_id, tool_name, arguments)
                     content = result if isinstance(result, str) else json.dumps(result, default=str)
                     await self.send_log(event_sink, "tool_result", f"Tool {name} executed successfully.", {"result": result})

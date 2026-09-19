@@ -11,6 +11,49 @@ It keeps the model and tool orchestration explicit and adds a browser-managed ga
 The default MCP server is `mcp-server-fetch`, launched through `uvx`. No LangGraph,
 LangChain, or hosted model is required.
 
+## Architecture
+
+The runtime has two entry points that share the same MCP gateway and llama.cpp
+orchestration layer:
+
+```text
+                         +----------------------+
+                         | Browser console       |
+                         | config + live events  |
+                         +----------+-----------+
+                                    |
+                         WebSocket /ws/agent/{id}
+                                    |
++-------------------+     +--------v---------+     +------------------+
+| A2A client        +---->| FastAPI gateway  +---->| MCP servers      |
+| JSON-RPC          |     | config + sessions|     | stdio processes  |
++-------------------+     +--------+---------+     +------------------+
+                                    |
+                         +----------v-----------+
+                         | AgentOrchestrator    |
+                         | llama.cpp tool loop  |
+                         | namespacing + HITL   |
+                         +----------+-----------+
+                                    |
+                         OpenAI-compatible API
+                                    |
+                         +----------v-----------+
+                         | Local llama.cpp      |
+                         +----------------------+
+```
+
+`ToolNamespacer` exposes tools to the model as `{server_id}__{tool_name}` and
+resolves each selection back to the correct MCP server. The orchestrator sends
+structured `info`, `turn_start`, `tool_call`, `tool_result`, `error`, `final`, and
+`awaiting_approval` events to the browser while retaining the normal A2A response
+path.
+
+Tools listed in `RESTRICTED_TOOLS` pause the session before execution. The browser
+receives an `awaiting_approval` event containing the call ID, tool, and arguments;
+it then sends an `approval_response`. Approval resumes the MCP call, while denial
+feeds a structured rejection result back to llama.cpp so the model can recover.
+Disconnects cancel active tasks and pending approval futures.
+
 ## Run it
 
 Install with uv:
@@ -59,10 +102,12 @@ The FastAPI endpoints are available under `/api`:
 - `POST /api/servers/{id}/connect` and `/disconnect` manage a connection.
 - `POST /api/tools/test` calls one enabled tool directly.
 - `GET /api/model/status` checks the llama.cpp `/models` endpoint.
+- `WS /ws/agent` accepts `start_task` and `approval_response` messages.
+- `WS /ws/agent/{session_id}` provides the session-aware HITL stream used by the UI.
 
 The gateway validates every model tool call against the saved allowlist. Duplicate
-tool names across enabled servers are rejected as ambiguous until they are
-namespaced, which is a safe starting point for adding more MCP servers.
+tool names across enabled servers are namespaced before they are sent to the model,
+then resolved back to the originating server before execution.
 
 ## Safety notes
 
